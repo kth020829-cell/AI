@@ -98,7 +98,7 @@ company_profile_override  선택. 미등록 기업 인재상 직접 입력값
 question_count            선택. 3 | 6 | 9. 기본값 6
 retry_of_session_id       선택. 재연습이면 최초 세션 ID
 replay_log                재연습일 때만 필수. 최초 세션의 진행 로그
-doc_id                    선택. 이력서 RAG 인덱스 재사용 키
+doc_id                    선택. 이력서 파싱 결과 재사용 키
 ```
 
 토픽 수는 보내지 않는다. `question_count`에서 자동으로 결정된다.
@@ -117,7 +117,7 @@ doc_id                    선택. 이력서 RAG 인덱스 재사용 키
 company_profile_override   미등록 기업 인재상을 사용자가 직접 입력한 경우
                            값이 있으면 company_id보다 우선한다
 
-doc_id                     이력서를 한 번 파싱해 만든 RAG 인덱스의 키
+doc_id                     이력서를 한 번 파싱한 결과의 키
                            같은 이력서로 다시 면접할 때 파싱을 건너뛴다
                            null이면 resume_file_url로 새로 파싱한다
 ```
