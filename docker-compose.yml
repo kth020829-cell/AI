@@ -18,6 +18,9 @@ services:
       # 백엔드가 X-Cueanda-Secret 헤더에 넣어 보내는 값.
       # .env 파일이나 셸 환경변수로 덮어쓸 수 있다. .env.example 참고.
       CUEANDA_SHARED_SECRET: ${CUEANDA_SHARED_SECRET:-dummy-secret}
+      # 세션과 작업을 어디에 보관할지. 비워 두면 프로세스 메모리를 쓴다.
+      # 메모리를 쓰면 워커가 하나여야 하고, 재시작하면 진행 중이던 세션이 사라진다.
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       # dummy면 고정 문장, llm이면 이력서를 읽고 주질문을 실제로 생성한다.
       AI_MODE: ${AI_MODE:-dummy}
       # 폴링을 몇 번 해야 done이 되는가. 0이면 즉시 done.
@@ -28,4 +31,20 @@ services:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       LLM_MODEL: ${LLM_MODEL:-claude-sonnet-5}
       LLM_EFFORT: ${LLM_EFFORT:-medium}
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # 세션과 작업 보관소. 이게 있어야 워커를 여러 개 띄울 수 있다.
+  # 붙지 못하면 AI 서버가 메모리로 떨어져서 그대로 뜨긴 한다.
+  redis:
+    image: redis:7-alpine
+    container_name: cue-ai-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     restart: unless-stopped

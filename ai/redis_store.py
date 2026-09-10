@@ -31,15 +31,98 @@
 FastAPI가 직렬화할 때 실제 BaseModel 타입이어야 하므로 프록시로 감싸지 않고
 그대로 돌려준다.
 """
+import logging
 import os
 import pickle
-from typing import Any, Dict, Iterator, Optional
+import threading
+from typing import Any, Dict, Iterator, List, Optional
 
-import redis
 from pydantic import BaseModel
 
-_REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
-_client: Optional[redis.Redis] = None
+logger = logging.getLogger("cue.ai.store")
+
+# redis 패키지도 서버도 없을 수 있다. 그때는 프로세스 메모리로 떨어진다.
+#
+#   있으면    워커 여러 개가 같은 세션을 본다
+#   없으면    워커 하나 안에서만 유효하다. 예전과 같은 동작이다
+#
+# 더미 서버는 백엔드가 docker run 한 줄로 띄우는 것이 약속이라, Redis를
+# 띄우지 않았다고 서버가 못 뜨면 안 된다. 테스트도 마찬가지다.
+try:
+    import redis as _redis
+except ImportError:
+    _redis = None
+
+_REDIS_URL = os.environ.get("REDIS_URL", "")
+_client = None
+
+
+class _MemoryClient:
+    """redis_store가 쓰는 열 개 명령만 흉내내는 프로세스 안 저장소.
+
+    Redis가 없을 때 이것으로 떨어진다. 인터페이스가 같아서 RedisDict와
+    RedisCounter는 자기가 무엇을 쓰는지 몰라도 된다.
+    """
+
+    def __init__(self):
+        self._kv: Dict[str, Any] = {}
+        self._lists: Dict[str, List[str]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            return self._kv.get(key)
+
+    def set(self, key, value):
+        with self._lock:
+            self._kv[key] = value
+
+    def setnx(self, key, value):
+        with self._lock:
+            if key in self._kv:
+                return False
+            self._kv[key] = value
+            return True
+
+    def incr(self, key):
+        with self._lock:
+            value = int(self._kv.get(key, 0)) + 1
+            self._kv[key] = value
+            return value
+
+    def delete(self, *keys):
+        with self._lock:
+            for key in keys:
+                self._kv.pop(key, None)
+                self._lists.pop(key, None)
+
+    def exists(self, key):
+        with self._lock:
+            return 1 if key in self._kv else 0
+
+    def rpush(self, key, value):
+        with self._lock:
+            self._lists.setdefault(key, []).append(value)
+
+    def lrem(self, key, count, value):
+        with self._lock:
+            items = self._lists.get(key)
+            if items and value in items:
+                items.remove(value)
+
+    def llen(self, key):
+        with self._lock:
+            return len(self._lists.get(key, []))
+
+    def lrange(self, key, start, end):
+        with self._lock:
+            items = list(self._lists.get(key, []))
+        return items if end == -1 else items[start : end + 1]
+
+
+def using_redis() -> bool:
+    """지금 Redis를 쓰고 있는가. 워커를 늘려도 되는지가 이 값에 달려 있다."""
+    return not isinstance(_get_client(), _MemoryClient)
 
 # Redis에 못 넣는 값(예: ai/tasks.py의 BackgroundTask — threading.Lock을 들고 있어
 # pickle 자체가 안 됨)을 저장할 때 대신 넣어두는 표식.
@@ -50,11 +133,41 @@ _LOCAL_FALLBACK_MARKER = b"__LOCAL_FALLBACK__"
 _PLAIN_TYPES = (str, int, float, bool, bytes, type(None), list, dict, tuple, set)
 
 
-def _get_client() -> redis.Redis:
+def _get_client():
+    """Redis에 붙는다. 못 붙으면 메모리로 떨어지고 경고만 남긴다.
+
+    REDIS_URL이 비어 있으면 아예 시도하지 않는다. 로컬 개발과 테스트에서
+    없는 서버에 붙으려다 매번 몇 초씩 기다리는 일을 막기 위해서다.
+    """
     global _client
-    if _client is None:
-        _client = redis.from_url(_REDIS_URL)
+    if _client is not None:
+        return _client
+
+    url = os.environ.get("REDIS_URL", "").strip()
+    if not url or _redis is None:
+        if url and _redis is None:
+            logger.warning("REDIS_URL이 있지만 redis 패키지가 없습니다. 메모리로 진행합니다")
+        _client = _MemoryClient()
+        return _client
+
+    try:
+        candidate = _redis.from_url(url, socket_connect_timeout=2)
+        candidate.ping()
+    except Exception as e:
+        # 서버가 아직 안 떴을 수 있다. 여기서 죽으면 더미 서버 자체가 못 뜬다.
+        logger.warning("Redis에 붙지 못했습니다 (%s). 메모리로 진행합니다", type(e).__name__)
+        _client = _MemoryClient()
+        return _client
+
+    logger.info("세션 · 작업 보관소로 Redis를 씁니다")
+    _client = candidate
     return _client
+
+
+def reset_client() -> None:
+    """다음 호출 때 다시 붙는다. 테스트에서 REDIS_URL을 바꿀 때 쓴다."""
+    global _client
+    _client = None
 
 
 class RedisProxy:
@@ -91,7 +204,7 @@ class RedisDict:
       메서드 호출 시 자동 재저장되게 한다
     """
 
-    def __init__(self, namespace: str, client: Optional[redis.Redis] = None):
+    def __init__(self, namespace: str, client=None):
         self._ns = namespace
         self._client = client or _get_client()
         self._order_key = f"{namespace}:_order"
@@ -193,7 +306,7 @@ class RedisCounter:
     서로 다른 워커가 같은 task_id를 만들어 충돌한다.
     """
 
-    def __init__(self, name: str, start: int = 0, client: Optional[redis.Redis] = None):
+    def __init__(self, name: str, start: int = 0, client=None):
         self._key = f"counter:{name}"
         self._client = client or _get_client()
         self._client.setnx(self._key, start)
