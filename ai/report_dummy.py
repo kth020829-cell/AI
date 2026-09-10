@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from ai.dummy import answer_length
+from ai.redis_store import RedisCounter, RedisDict
 from ai.report_schemas import (
     AXIS_WEIGHTS,
     Axes,
@@ -553,17 +554,20 @@ def _by_question(items) -> list[ByQuestion]:
 # 멱등성 — 같은 Idempotency-Key로 다시 요청하면 기존 task_id를 돌려준다
 # ---------------------------------------------------------------------------
 
-_TASK_SEQ = itertools.count(1)
+# 워커마다 따로 노는 itertools.count 대신 Redis INCR로 워커 간 원자적으로 증가.
+# dummy.py의 _TASK_SEQ와는 별도 카운터 (task_r 접두사가 겹치면 안 되므로 네임스페이스 분리).
+_TASK_SEQ = RedisCounter("report_task_seq")
 
 # 태스크 상한과 맞춘다. 키가 지워지면 같은 키로 다시 요청했을 때 새 작업이 생기는데,
 # 그 시점에는 원래 태스크도 이미 정리된 뒤라 어차피 다시 만들어야 한다.
 MAX_IDEMPOTENCY_KEYS = 5000
 
-IDEMPOTENCY: dict[str, str] = {}
+# Redis로 이전 (2026-09-08). SESSIONS/TASKS와 같은 이유 - 워커 간 공유 필요.
+IDEMPOTENCY = RedisDict("idempotency")
 
 
 def new_report_task_id() -> str:
-    return f"task_r{next(_TASK_SEQ):03d}"
+    return f"task_r{_TASK_SEQ.next():03d}"
 
 
 def remember(idempotency_key: str, task_id: str) -> None:

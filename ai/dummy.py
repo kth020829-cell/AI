@@ -12,6 +12,7 @@ from typing import Optional, Union
 
 from pydantic import BaseModel
 
+from ai.redis_store import RedisCounter, RedisDict
 from ai.schemas import (
     Persona,
     TaskProcessingResponse,
@@ -172,11 +173,13 @@ def read_task(task_id: str):
 # 세션
 # ---------------------------------------------------------------------------
 
-_TASK_SEQ = itertools.count(1)
+# 워커마다 따로 노는 itertools.count 대신 Redis INCR로 워커 간 원자적으로 증가.
+# 안 바꾸면 워커 A와 B가 동시에 task_001을 만들어 서로 덮어쓴다.
+_TASK_SEQ = RedisCounter("dummy_task_seq")
 
 
 def _new_task_id() -> str:
-    return f"task_{next(_TASK_SEQ):03d}"
+    return f"task_{_TASK_SEQ.next():03d}"
 
 
 def _new_session_id() -> str:
@@ -403,10 +406,17 @@ def evict_oldest(store: dict, limit: int) -> None:
         store.pop(next(iter(store)))
 
 
-SESSIONS: dict[str, DummySession] = {}
+# Redis로 이전 (2026-09-08). 워커가 여러 개일 때 요청이 다른 프로세스로 가면
+# 메모리 dict에는 없어서 SESSION_NOT_FOUND가 났다. 재배포하면 전부 사라지는
+# 것도 같은 원인. RedisDict가 dict와 같은 인터페이스를 흉내내므로 아래
+# register_task/save_task/create_session/reset은 전혀 손대지 않았다.
+# (RedisDict가 돌려주는 객체는 메서드를 호출하면 자동으로 Redis에 재저장되므로
+#  PendingTask.poll()이나 DummySession.answer() 같은 변형 메서드도 그대로 동작한다.
+#  자세한 내용은 ai/redis_store.py 상단 설명 참고)
+SESSIONS = RedisDict("sessions")
 # 질문 생성 결과와 리포트 생성 결과가 같은 보관소를 쓴다.
 # GET /ai/tasks/{task_id}가 두 계약에서 공유되는 엔드포인트이기 때문이다.
-TASKS: dict[str, BaseModel] = {}
+TASKS = RedisDict("tasks")
 
 
 def reset() -> None:
@@ -469,4 +479,10 @@ def create_session(
     )
     SESSIONS[session_id] = session
     evict_oldest(SESSIONS, MAX_SESSIONS)
-    return session
+
+    # 원본 session이 아니라 SESSIONS[session_id]로 다시 꺼내서 반환한다.
+    # 원본을 그대로 반환하면, 호출부(ai/pipeline.py)가 곧바로 session.start()를
+    # 불러도 그 변화가 Redis에 반영되지 않는다 (원본은 Redis를 거치지 않은
+    # 로컬 참조라서). 다시 꺼내면 RedisProxy로 감싸져서, 이후 이 반환값에 대고
+    # 부르는 모든 메서드가 자동으로 Redis에 재저장된다.
+    return SESSIONS[session_id]
