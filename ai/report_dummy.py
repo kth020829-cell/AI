@@ -876,14 +876,35 @@ def build_compare(req: CompareRequest) -> CompareResponse:
     )
 
 
-def _replay_scores(item) -> dict[str, QuestionScore]:
-    """비교 대상은 is_replay가 true인 문항뿐이다. is_spare_topic은 필터에 쓰지 않는다."""
-    return {q.question_id: q for q in item.report.questions if q.is_replay}
+def _comparable_scores(items) -> list[dict[str, QuestionScore]]:
+    """회차마다 비교할 수 있는 문항. {question_id: 문항}
+
+    재면접 회차는 is_replay가 true인 문항(1회차와 같은 주질문)만 비교한다.
+    is_spare_topic은 필터에 쓰지 않는다.
+
+    1회차(round 1)는 재면접이 아니라서 문항이 전부 is_replay false다. 그대로 거르면
+    1회차가 들어간 비교는 문항별 결과가 늘 비게 된다. 재면접은 1회차 replay_log 순서를
+    그대로 재생해 같은 주질문이 같은 question_id를 받으므로, 1회차에서는 다른 회차가
+    is_replay로 다시 낸 question_id만 고른다.
+    """
+    replay = [{q.question_id: q for q in i.report.questions if q.is_replay} for i in items]
+    replayed_ids = set()
+    for item, scores in zip(items, replay):
+        if item.round != 1:
+            replayed_ids |= set(scores)
+
+    out = []
+    for item, scores in zip(items, replay):
+        if item.round == 1:
+            scores = {q.question_id: q for q in item.report.questions
+                      if q.question_id in replayed_ids}
+        out.append(scores)
+    return out
 
 
 def _vs_previous(items) -> VsPrevious:
     prev, cur = items[-2], items[-1]
-    prev_q, cur_q = _replay_scores(prev), _replay_scores(cur)
+    prev_q, cur_q = _comparable_scores(items)[-2:]
     shared = [qid for qid in cur_q if qid in prev_q]
 
     improved = [q for q in shared if cur_q[q].score > prev_q[q].score]
@@ -893,8 +914,9 @@ def _vs_previous(items) -> VsPrevious:
     both_complete = (
         prev.report.report_status == "complete" and cur.report.report_status == "complete"
     )
+    # 부분 리포트가 끼면 비교 불가라 null이다. 0(변화 없음)과 구분한다
     overall_delta = (
-        cur.report.overall.score - prev.report.overall.score if both_complete else 0
+        cur.report.overall.score - prev.report.overall.score if both_complete else None
     )
 
     delta = {}
@@ -926,9 +948,10 @@ def _stalled(axes_trend: dict[str, list[Optional[int]]]) -> list[str]:
 
 def _by_question(items) -> list[ByQuestion]:
     """모든 회차에 공통으로 있는 is_replay 문항만 담는다."""
-    per_round = [_replay_scores(i) for i in items]
+    per_round = _comparable_scores(items)
     if not per_round:
         return []
+    first_round = items[0].round
 
     shared = set(per_round[0])
     for m in per_round[1:]:
@@ -949,7 +972,7 @@ def _by_question(items) -> list[ByQuestion]:
             scores=scores,
             delta_from_previous=from_prev,
             delta_from_first=from_first,
-            comment=_question_comment(from_prev, from_first, len(scores)),
+            comment=_question_comment(from_prev, from_first, len(scores), first_round),
         ))
     return out
 
@@ -989,7 +1012,7 @@ def _trend_comment(axes_trend: dict, stalled: list) -> str:
     return text
 
 
-def _question_comment(from_prev: int, from_first: int, rounds: int) -> str:
+def _question_comment(from_prev: int, from_first: int, rounds: int, first_round: int = 1) -> str:
     if rounds < 2:
         return "비교할 이전 회차가 없습니다."
     if from_prev > 0:
@@ -999,7 +1022,8 @@ def _question_comment(from_prev: int, from_first: int, rounds: int) -> str:
     else:
         text = "직전 회차와 같은 점수입니다."
     if rounds > 2:
-        text += f" 1회차 대비 {_signed(from_first)}점입니다."
+        # 비교한 첫 회차가 1회차가 아닐 수 있다 (1회차 리포트가 없을 때 [2, 3])
+        text += f" {first_round}회차 대비 {_signed(from_first)}점입니다."
     return text
 
 

@@ -647,6 +647,72 @@ def test_부분_리포트_회차는_총점에서_제외된다(client, auth):
     assert body.trend.axes.gaze[1] is None        # 실패한 축도 null
 
 
+def _real_rounds(client, auth, round_numbers, partial=()):
+    """실제와 같은 회차 묶음. 1회차는 재면접이 아니라 문항이 전부 is_replay false다.
+
+    재면접(2회차~)은 홀수 번호 주질문만 1회차와 같은 질문(is_replay true)이다.
+    """
+    out = []
+    for r in round_numbers:
+        kw = {"video": "fail"} if r in partial else {}
+        answers = [answer(n, is_replay=(r != 1 and n % 2 == 1), **kw) for n in range(1, 7)]
+        sid = f"sess_real{r}"
+        result, _ = make_report(client, auth, answers, session_id=sid, idem=700 + r)
+        out.append({"session_id": sid, "round": r, "report": result})
+    return out
+
+
+def _compare(client, auth, reports):
+    res = client.post("/ai/reports/compare", headers=auth, json={"reports": reports})
+    assert res.status_code == 200, res.json()
+    return CompareResponse.model_validate(res.json())
+
+
+def test_1회차는_is_replay가_false여도_재면접_문항과_짝을_맞춘다(client, auth):
+    """1회차 문항은 재면접이 아니라 is_replay가 전부 false다. 그래도 문항별 비교가 비면 안 된다."""
+    body = _compare(client, auth, _real_rounds(client, auth, [1, 2]))
+
+    assert [q.question_id for q in body.by_question] == ["q_1", "q_3", "q_5"]
+    for q in body.by_question:
+        assert len(q.scores) == 2
+    vs = body.vs_previous
+    assert (vs.from_round, vs.to_round) == (1, 2)
+    assert sorted(vs.improved + vs.declined + vs.unchanged) == ["q_1", "q_3", "q_5"]
+
+
+def test_1회차만_보내면_문항별_비교가_비어_있다(client, auth):
+    """비교할 재면접이 없으니 1회차 문항(꼬리질문 포함)을 늘어놓지 않는다."""
+    body = _compare(client, auth, _real_rounds(client, auth, [1]))
+    assert body.vs_previous is None
+    assert body.by_question == []
+
+
+def test_회차_번호는_보낸_그대로_쓴다(client, auth):
+    """2회차 리포트가 없으면 [1, 3]이 온다. 다시 매기지 않고 직전 비교는 3 vs 1이다."""
+    body = _compare(client, auth, _real_rounds(client, auth, [1, 3]))
+    assert body.compared_rounds == [1, 3]
+    assert body.latest_round == 3
+    assert (body.vs_previous.from_round, body.vs_previous.to_round) == (1, 3)
+    assert [q.question_id for q in body.by_question] == ["q_1", "q_3", "q_5"]
+
+
+def test_첫_비교_회차가_2회차면_코멘트도_2회차_기준이다(client, auth):
+    body = _compare(client, auth, _real_rounds(client, auth, [2, 3, 4]))
+    assert body.compared_rounds == [2, 3, 4]
+    for q in body.by_question:
+        assert q.delta_from_first == q.scores[-1] - q.scores[0]
+        assert "2회차 대비" in q.comment and "1회차" not in q.comment
+
+
+def test_부분_리포트가_끼면_overall_delta는_null이다(client, auth):
+    """0(변화 없음)과 구분해야 한다. 축 변화는 양쪽 값이 있는 축만 숫자다."""
+    body = _compare(client, auth, _real_rounds(client, auth, [1, 2], partial={2}))
+    vs = body.vs_previous
+    assert vs.overall_delta is None
+    assert vs.axis_delta.gaze is None
+    assert vs.axis_delta.content is not None
+
+
 def test_reports가_비면_400(client, auth):
     res = client.post("/ai/reports/compare", headers=auth, json={"reports": []})
     assert res.status_code == 400

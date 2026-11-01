@@ -275,7 +275,7 @@ class VsPrevious(BaseModel):
 
     from_round: int
     to_round: int
-    overall_delta: int
+    overall_delta: Optional[int]      # 두 회차 중 하나라도 부분 리포트면 null
     axis_delta: AxisDelta
     improved: list[str]
     declined: list[str]

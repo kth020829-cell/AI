@@ -626,18 +626,50 @@ POST /ai/reports/compare     (폴링 없이 즉시 응답)
 ] }
 ```
 
-- `round`는 1부터, 배열은 회차 오름차순. 회차 수 제한 없음. AI가 저장하지 않으므로 백엔드가 모아서 보냅니다.
-- 1회차만 보내도 오류가 아니고 `vs_previous`가 null입니다. 빈 배열은 400.
+- `round`는 연습 기록의 회차 번호를 그대로 보냅니다. **1회차(원래 면접)는 반드시 `round: 1`입니다.** 비어도 됩니다(`[1, 3]`, `[2, 3]`). 다시 매기지 않으며, 같은 번호를 두 번 보내지만 않으면 됩니다.
+- 배열은 회차 오름차순(AI도 `round`로 다시 정렬). 회차 수 제한 없음. AI가 저장하지 않으므로 백엔드가 모아서 보냅니다.
+- 1회차만 보내도 오류가 아니고 `vs_previous`가 null, `by_question`이 빈 배열입니다. 빈 배열은 400.
+- LLM을 부르지 않습니다. 코멘트는 점수 변화로 만든 문장이라 요금이 없고, 같은 입력이면 항상 같은 결과입니다.
+
+```json
+200
+{
+  "latest_round": 3,
+  "compared_rounds": [1, 2, 3],
+  "vs_previous": {
+    "from_round": 2, "to_round": 3,
+    "overall_delta": null,
+    "axis_delta": { "content": 6, "speech": 3, "gaze": null },
+    "improved": ["q_1"], "declined": ["q_3"], "unchanged": ["q_5"],
+    "comment": "부분 리포트가 포함되어 총점은 비교하지 않았습니다."
+  },
+  "trend": {
+    "overall": [68, null, 74],
+    "axes": { "content": [70, 72, 78], "speech": [61, 60, 63], "gaze": [55, null, 58] },
+    "comment": "첫 회차부터 지금까지 내용 70→78, 말하기 61→63, 시선 55→58.",
+    "stalled_axes": [],
+    "best_round": 3
+  },
+  "by_question": [
+    { "question_id": "q_1", "text": "1번 지원동기", "category": "지원동기",
+      "scores": [62, 70, 75], "delta_from_previous": 5, "delta_from_first": 13,
+      "comment": "직전 회차보다 5점 올랐습니다. 1회차 대비 +13점입니다." }
+  ],
+  "partial_rounds": [2]
+}
+```
 
 | 응답 필드 | 내용 |
 | --- | --- |
-| `latest_round`, `compared_rounds` | 마지막 회차, 비교한 회차 목록 |
-| `vs_previous` | 직전 회차 대비: `overall_delta`, `axis_delta`, `improved` · `declined` · `unchanged`(question_id 목록), `comment` |
-| `trend` | 회차별 `overall` · `axes` 배열, `comment`, `stalled_axes`(최근 3회차 정체 축), `best_round` |
-| `by_question[]` | 문항별 `scores`(회차별, 그래프용), `delta_from_previous`, `delta_from_first`, `comment` |
+| `latest_round`, `compared_rounds` | 마지막 회차, 비교한 회차 목록(보낸 번호 그대로). 아래 배열의 n번째 값은 `compared_rounds`의 n번째 회차 |
+| `vs_previous` | 배열에서 **바로 앞 회차** 대비(`[1, 3]`이면 3 vs 1). `from_round` · `to_round`, `overall_delta`(둘 중 하나라도 부분 리포트면 null), `axis_delta`(한쪽 축이 실패 · 미사용이면 null), `improved` · `declined` · `unchanged`(question_id 목록), `comment`. 회차가 1개면 null |
+| `trend` | 회차별 `overall`(부분 리포트 회차는 null) · `axes`(실패 · 미사용 축은 null) 배열, `comment`, `stalled_axes`(최근 3회차 정체 축), `best_round`(overall이 있는 회차 중 최고, 전부 null이면 마지막 회차) |
+| `by_question[]` | 비교한 **모든 회차에 있는** 문항만. `scores`(회차별 문항 점수 `questions[].score`, null 없음), `delta_from_previous`, `delta_from_first`(배열의 첫 회차 기준), `comment`. `text`는 "1번 지원동기" 같은 자리표시라 화면에는 백엔드가 저장한 질문 문장을 씁니다 |
 | `partial_rounds` | 부분 리포트였던 회차. 이 회차는 `trend.overall`이 null (그래프에서 끊거나 점선) |
 
-**비교 대상은 `is_replay: true`인 문항만입니다.** `is_spare_topic`으로 거르지 않습니다(1회차 예비 토픽 질문도 재면접에서 재현되므로 비교 대상).
+**문항 짝 맞추기:** 재면접은 1회차 `replay_log`를 순서대로 재생하므로, 다시 나온 주질문은 1회차와 **같은 `question_id`**를 받습니다(되묻기는 번호를 쓰지 않고, 꼬리질문을 건너뛰어도 그 자리를 대체 질문이 채워 번호가 밀리지 않음). 그래서 모든 회차에서 같은 ID로 짝을 맞추고, 백엔드가 따로 보낼 것은 없습니다.
+
+**비교 대상 문항:** 재면접 회차에서는 `is_replay: true`인 문항만 봅니다. `is_spare_topic`으로 거르지 않습니다(1회차 예비 토픽 질문도 재면접에서 재현되므로 비교 대상). 1회차는 재면접이 아니라 문항이 전부 `is_replay: false`이므로, 다른 회차가 `is_replay`로 다시 낸 question_id만 비교에 씁니다.
 
 ---
 
@@ -728,6 +760,7 @@ URL은 만료되므로 저장하지 않고 **object key를 저장해 요청할 �
 | 회복력 산출식 미정 | 확정 (13장) |
 | 축 가중치 미정 | 확정 0.5 · 0.25 · 0.25 |
 | 회차 비교 필터 `is_spare_topic` 포함 | `is_replay`만 |
+| 회차 비교: 1회차가 끼면 문항별 비교가 빔 · 부분 리포트면 `overall_delta` 0 | 1회차는 재면접 문항과 같은 ID로 짝을 맞춤 · `overall_delta` null · 응답 예시 추가 (2026-11-01) |
 | 총평 · 문항 코멘트 없음 | `summary`, `questions[].comment` 추가 (2026-10-01). 기존 필드는 그대로라 저장 방식 변경 없음 |
 
 ---
